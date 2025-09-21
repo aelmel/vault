@@ -33,6 +33,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cloudflare/circl/kem/kyber/kyber1024"
+	"github.com/cloudflare/circl/kem/kyber/kyber512"
+	"github.com/cloudflare/circl/kem/kyber/kyber768"
+	"github.com/cloudflare/circl/kem/schemes"
 	"github.com/hashicorp/errwrap"
 	"github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/vault/sdk/helper/cryptoutil"
@@ -78,6 +82,7 @@ const (
 	KeyType_SLH_DSA
 	KeyType_AES128_CBC
 	KeyType_AES256_CBC
+	KeyType_KYBER
 	// If adding to this list please update allTestKeyTypes in policy_test.go
 )
 
@@ -97,6 +102,9 @@ const (
 	ParameterSet_SLH_DSA_SHAKE_256S = "slh-dsa-shake-256s"
 	ParameterSet_SLH_DSA_SHA2_256F  = "slh-dsa-sha2-256f"
 	ParameterSet_SLH_DSA_SHAKE_256F = "slh-dsa-shake-256f"
+	ParameterSet_KYBER_512          = "kyber-512"
+	ParameterSet_KYBER_768          = "kyber-768"
+	ParameterSet_KYBER_1024         = "kyber-1024"
 )
 
 const (
@@ -197,7 +205,7 @@ type KeyType int
 
 func (kt KeyType) EncryptionSupported() bool {
 	switch kt {
-	case KeyType_AES128_GCM96, KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305, KeyType_RSA2048, KeyType_RSA3072, KeyType_RSA4096, KeyType_MANAGED_KEY, KeyType_AES128_CBC, KeyType_AES256_CBC:
+	case KeyType_AES128_GCM96, KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305, KeyType_RSA2048, KeyType_RSA3072, KeyType_RSA4096, KeyType_MANAGED_KEY, KeyType_AES128_CBC, KeyType_AES256_CBC, KeyType_KYBER:
 		return true
 	}
 	return false
@@ -205,7 +213,7 @@ func (kt KeyType) EncryptionSupported() bool {
 
 func (kt KeyType) DecryptionSupported() bool {
 	switch kt {
-	case KeyType_AES128_GCM96, KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305, KeyType_RSA2048, KeyType_RSA3072, KeyType_RSA4096, KeyType_MANAGED_KEY, KeyType_AES128_CBC, KeyType_AES256_CBC:
+	case KeyType_AES128_GCM96, KeyType_AES256_GCM96, KeyType_ChaCha20_Poly1305, KeyType_RSA2048, KeyType_RSA3072, KeyType_RSA4096, KeyType_MANAGED_KEY, KeyType_AES128_CBC, KeyType_AES256_CBC, KeyType_KYBER:
 		return true
 	}
 	return false
@@ -257,6 +265,8 @@ func (kt KeyType) HMACSupported() bool {
 	case kt.CMACSupported():
 		return false
 	case kt == KeyType_MANAGED_KEY:
+		return false
+	case kt == KeyType_KYBER:
 		return false
 	default:
 		return true
@@ -331,6 +341,8 @@ func (kt KeyType) String() string {
 		return "aes128-cbc"
 	case KeyType_AES256_CBC:
 		return "aes256-cbc"
+	case KeyType_KYBER:
+		return "kyber"
 	}
 
 	return "[unknown]"
@@ -1204,6 +1216,16 @@ func (p *Policy) DecryptWithOptions(opts EncryptionOptions, value string, factor
 			return "", err
 		}
 
+	case KeyType_KYBER:
+		keyEntry, err := p.safeGetKeyEntry(ver)
+		if err != nil {
+			return "", err
+		}
+		plain, err = decryptWithKyber(p.ParameterSet, keyEntry, decoded)
+		if err != nil {
+			return "", err
+		}
+
 	default:
 		plain, err = entDecryptWithOptions(p, opts, decoded)
 		if err != nil {
@@ -1876,6 +1898,12 @@ func (p *Policy) RotateInMemory(randReader io.Reader) (retErr error) {
 
 		entry.RSAPublicKey = entry.RSAKey.Public().(*rsa.PublicKey)
 
+	case KeyType_KYBER:
+		err := generateKyberKey(p.ParameterSet, &entry)
+		if err != nil {
+			return err
+		}
+
 	default:
 		if err := entRotateInMemory(p, &entry, randReader); err != nil {
 			return err
@@ -2294,6 +2322,17 @@ func (p *Policy) EncryptWithOptions(opts EncryptionOptions, value string, factor
 		}
 
 		ciphertext, err = p.encryptWithManagedKey(managedKeyFactory.GetManagedKeyParameters(), keyEntry, plaintext, opts.Nonce, aad)
+		if err != nil {
+			return "", err
+		}
+
+	case KeyType_KYBER:
+		keyEntry, err := p.safeGetKeyEntry(opts.KeyVersion)
+		if err != nil {
+			return "", err
+		}
+
+		ciphertext, err = encryptWithKyber(p.ParameterSet, keyEntry, plaintext)
 		if err != nil {
 			return "", err
 		}
@@ -2886,4 +2925,226 @@ func (p *Policy) setKDF(ctx context.Context, storage logical.Storage, kdf int) e
 	}
 
 	return nil
+}
+
+func generateKyberKey(parameterSet string, entry *KeyEntry) error {
+	var privateKey []byte
+	var publicKey []byte
+
+	switch parameterSet {
+	case ParameterSet_KYBER_512:
+		pub, priv, _ := kyber512.GenerateKeyPair(rand.Reader)
+		publicKey = make([]byte, kyber512.PublicKeySize)
+		privateKey = make([]byte, kyber512.PrivateKeySize)
+		pub.Pack(publicKey)
+		priv.Pack(privateKey)
+	case ParameterSet_KYBER_768:
+		pub, priv, _ := kyber768.GenerateKeyPair(rand.Reader)
+		publicKey = make([]byte, kyber768.PublicKeySize)
+		privateKey = make([]byte, kyber768.PrivateKeySize)
+		pub.Pack(publicKey)
+		priv.Pack(privateKey)
+	case ParameterSet_KYBER_1024:
+		pub, priv, _ := kyber1024.GenerateKeyPair(rand.Reader)
+		publicKey = make([]byte, kyber1024.PublicKeySize)
+		privateKey = make([]byte, kyber1024.PrivateKeySize)
+		pub.Pack(publicKey)
+		priv.Pack(privateKey)
+	default:
+		return fmt.Errorf("unsupported Kyber parameter set: %s", parameterSet)
+	}
+
+	entry.Key = privateKey
+	entry.FormattedPublicKey = base64.StdEncoding.EncodeToString(publicKey)
+	return nil
+}
+
+var (
+	kyber512Schema  = schemes.ByName("Kyber512")
+	kyber768Schema  = schemes.ByName("Kyber768")
+	kyber1024Schema = schemes.ByName("Kyber1024")
+)
+
+func encryptWithKyber(parameterSet string, keyEntry KeyEntry, plaintext []byte) ([]byte, error) {
+	publicKeyBytes, err := base64.StdEncoding.DecodeString(keyEntry.FormattedPublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode Kyber public key: %v", err)
+	}
+
+	switch parameterSet {
+	case ParameterSet_KYBER_512:
+		publicKey := &kyber512.PublicKey{}
+		publicKey.Unpack(publicKeyBytes)
+		ciphertext, sharedSecret, err := kyber512Schema.Encapsulate(publicKey)
+		encryptedData, err := encryptWithAESGCM(sharedSecret[:], plaintext)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encrypt: %v", err)
+		}
+
+		result := make([]byte, len(ciphertext)+len(encryptedData))
+		copy(result, ciphertext)
+		copy(result[len(ciphertext):], encryptedData)
+		return result, nil
+
+	case ParameterSet_KYBER_768:
+		publicKey := &kyber768.PublicKey{}
+		publicKey.Unpack(publicKeyBytes)
+		ciphertext, sharedSecret, err := kyber768Schema.Encapsulate(publicKey)
+
+		encryptedData, err := encryptWithAESGCM(sharedSecret[:], plaintext)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encrypt: %v", err)
+		}
+
+		result := make([]byte, len(ciphertext)+len(encryptedData))
+		copy(result, ciphertext)
+		copy(result[len(ciphertext):], encryptedData)
+		return result, nil
+
+	case ParameterSet_KYBER_1024:
+		publicKey := &kyber1024.PublicKey{}
+		publicKey.Unpack(publicKeyBytes)
+		ciphertext, sharedSecret, err := kyber1024Schema.Encapsulate(publicKey)
+
+		encryptedData, err := encryptWithAESGCM(sharedSecret[:], plaintext)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encrypt: %v", err)
+		}
+
+		result := make([]byte, len(ciphertext)+len(encryptedData))
+		copy(result, ciphertext)
+		copy(result[len(ciphertext):], encryptedData)
+		return result, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported Kyber parameter set: %s", parameterSet)
+	}
+}
+
+func encryptWithAESGCM(key, plaintext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonce, err := uuid.GenerateRandomBytes(gcm.NonceSize())
+	if err != nil {
+		return nil, err
+	}
+
+	ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
+
+	result := make([]byte, len(nonce)+len(ciphertext))
+	copy(result, nonce)
+	copy(result[len(nonce):], ciphertext)
+
+	return result, nil
+}
+
+func decryptWithKyber(parameterSet string, keyEntry KeyEntry, ciphertext []byte) ([]byte, error) {
+	switch parameterSet {
+	case ParameterSet_KYBER_512:
+		privateKey := &kyber512.PrivateKey{}
+		privateKey.Unpack(keyEntry.Key)
+
+		kyberCiphertextSize := kyber512.CiphertextSize
+		if len(ciphertext) < kyberCiphertextSize {
+			return nil, fmt.Errorf("ciphertext too short for Kyber-512")
+		}
+
+		kyberCiphertext := ciphertext[:kyberCiphertextSize]
+		encryptedData := ciphertext[kyberCiphertextSize:]
+
+		sharedSecret, err := kyber512Schema.Decapsulate(privateKey, kyberCiphertext)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decapsulate Kyber-512: %v", err)
+		}
+
+		plaintext, err := decryptWithAESGCM(sharedSecret[:], encryptedData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt: %v", err)
+		}
+
+		return plaintext, nil
+
+	case ParameterSet_KYBER_768:
+		privateKey := &kyber768.PrivateKey{}
+		privateKey.Unpack(keyEntry.Key)
+
+		kyberCiphertextSize := kyber768.CiphertextSize
+		if len(ciphertext) < kyberCiphertextSize {
+			return nil, fmt.Errorf("ciphertext too short for Kyber-768")
+		}
+
+		kyberCiphertext := ciphertext[:kyberCiphertextSize]
+		encryptedData := ciphertext[kyberCiphertextSize:]
+
+		sharedSecret, err := kyber768Schema.Decapsulate(privateKey, kyberCiphertext)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unpack Kyber-768: %v", err)
+		}
+
+		plaintext, err := decryptWithAESGCM(sharedSecret[:], encryptedData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt: %v", err)
+		}
+
+		return plaintext, nil
+
+	case ParameterSet_KYBER_1024:
+		privateKey := &kyber1024.PrivateKey{}
+		privateKey.Unpack(keyEntry.Key)
+
+		kyberCiphertextSize := kyber1024.CiphertextSize
+		if len(ciphertext) < kyberCiphertextSize {
+			return nil, fmt.Errorf("ciphertext too short for Kyber-1024")
+		}
+
+		kyberCiphertext := ciphertext[:kyberCiphertextSize]
+		encryptedData := ciphertext[kyberCiphertextSize:]
+
+		sharedSecret, err := kyber1024Schema.Decapsulate(privateKey, kyberCiphertext)
+
+		plaintext, err := decryptWithAESGCM(sharedSecret[:], encryptedData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt: %v", err)
+		}
+
+		return plaintext, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported Kyber parameter set: %s", parameterSet)
+	}
+}
+
+func decryptWithAESGCM(key, ciphertext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+
+	nonce := ciphertext[:nonceSize]
+	trueCiphertext := ciphertext[nonceSize:]
+
+	plaintext, err := gcm.Open(nil, nonce, trueCiphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return plaintext, nil
 }
