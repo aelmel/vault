@@ -37,7 +37,7 @@ var allTestKeyTypes = []KeyType{
 	KeyType_AES256_GCM96, KeyType_ECDSA_P256, KeyType_ED25519, KeyType_RSA2048,
 	KeyType_RSA4096, KeyType_ChaCha20_Poly1305, KeyType_ECDSA_P384, KeyType_ECDSA_P521, KeyType_AES128_GCM96,
 	KeyType_RSA3072, KeyType_MANAGED_KEY, KeyType_HMAC, KeyType_AES128_CMAC, KeyType_AES256_CMAC, KeyType_ML_DSA,
-	KeyType_HYBRID, KeyType_AES192_CMAC, KeyType_SLH_DSA, KeyType_AES128_CBC, KeyType_AES256_CBC,
+	KeyType_HYBRID, KeyType_AES192_CMAC, KeyType_SLH_DSA, KeyType_AES128_CBC, KeyType_AES256_CBC, KeyType_KYBER,
 }
 
 func TestPolicy_KeyTypes(t *testing.T) {
@@ -66,6 +66,13 @@ func TestPolicy_HmacCmacSupported(t *testing.T) {
 			}
 			if keyType.CMACSupported() {
 				t.Fatalf("cmac should not have been be supported for keytype %s", keyType.String())
+			}
+		case KeyType_KYBER:
+			if keyType.HMACSupported() {
+				t.Fatalf("hmac should not be supported for keytype %s", keyType.String())
+			}
+			if keyType.CMACSupported() {
+				t.Fatalf("cmac should not be supported for keytype %s", keyType.String())
 			}
 		case KeyType_AES128_CMAC, KeyType_AES256_CMAC, KeyType_AES192_CMAC:
 			if keyType.HMACSupported() {
@@ -1262,4 +1269,59 @@ func isUnsupportedGoHashType(hashType HashType, err error) bool {
 	}
 
 	return false
+}
+
+func Test_Kyber_EncryptionDecryption(t *testing.T) {
+	t.Log("Testing Kyber encryption/decryption")
+
+	ctx := context.Background()
+	storage := &logical.InmemStorage{}
+	plaintext := []byte("Lorem impsum dolor sit amet, consectetur adipiscing elit.")
+	input := base64.StdEncoding.EncodeToString(plaintext)
+
+	kyberParameterSets := []string{
+		ParameterSet_KYBER_512,
+		ParameterSet_KYBER_768,
+		ParameterSet_KYBER_1024,
+	}
+
+	for _, parameterSet := range kyberParameterSets {
+		t.Run(parameterSet, func(t *testing.T) {
+			lm, _ := NewLockManager(false, 0)
+			p, _, err := lm.GetPolicy(ctx, PolicyRequest{
+				Upsert:       true,
+				Storage:      storage,
+				KeyType:      KeyType_KYBER,
+				Name:         "test-kyber-" + parameterSet,
+				ParameterSet: parameterSet,
+			}, rand.Reader)
+			if err != nil {
+				t.Fatalf("Failed to create Kyber policy: %v", err)
+			}
+			if p == nil {
+				t.Fatal("nil policy")
+			}
+
+			ciphertext, err := p.EncryptWithOptions(EncryptionOptions{}, input)
+			if err != nil {
+				t.Fatalf("Failed to encrypt with Kyber: %v", err)
+			}
+
+			decrypted, err := p.DecryptWithOptions(EncryptionOptions{}, ciphertext)
+			if err != nil {
+				t.Fatalf("Failed to decrypt with Kyber: %v", err)
+			}
+
+			decryptedPlaintext, err := base64.StdEncoding.DecodeString(decrypted)
+			if err != nil {
+				t.Fatalf("Failed to decode decrypted data: %v", err)
+			}
+
+			if !bytes.Equal(plaintext, decryptedPlaintext) {
+				t.Fatalf("Decrypted data does not match original plaintext")
+			}
+
+			p.Unlock()
+		})
+	}
 }
