@@ -1325,3 +1325,277 @@ func Test_Kyber_EncryptionDecryption(t *testing.T) {
 		})
 	}
 }
+
+func Test_Kyber_ErrorHandling(t *testing.T) {
+	ctx := context.Background()
+	storage := &logical.InmemStorage{}
+	lm, _ := NewLockManager(false, 0)
+
+	t.Run("InvalidParameterSet", func(t *testing.T) {
+		_, _, err := lm.GetPolicy(ctx, PolicyRequest{
+			Upsert:       true,
+			Storage:      storage,
+			KeyType:      KeyType_KYBER,
+			Name:         "test-kyber-invalid",
+			ParameterSet: "kyber-999",
+		}, rand.Reader)
+
+		if err == nil {
+			t.Fatal("Expected error for invalid parameter set, but got none")
+		}
+	})
+
+	t.Run("CorruptedCiphertext", func(t *testing.T) {
+		p, _, err := lm.GetPolicy(ctx, PolicyRequest{
+			Upsert:       true,
+			Storage:      storage,
+			KeyType:      KeyType_KYBER,
+			Name:         "test-kyber-corrupt",
+			ParameterSet: ParameterSet_KYBER_512,
+		}, rand.Reader)
+		if err != nil {
+			t.Fatalf("Failed to create policy: %v", err)
+		}
+		defer p.Unlock()
+
+		_, err = p.DecryptWithOptions(EncryptionOptions{}, "invalid-ciphertext")
+		if err == nil {
+			t.Fatal("Expected error for invalid ciphertext, but got none")
+		}
+
+		plaintext := []byte("Test message")
+		input := base64.StdEncoding.EncodeToString(plaintext)
+
+		validCiphertext, err := p.EncryptWithOptions(EncryptionOptions{}, input)
+		if err != nil {
+			t.Fatalf("Failed to encrypt: %v", err)
+		}
+
+		corruptedCiphertext := validCiphertext[:len(validCiphertext)-10] + "corrupted!"
+		_, err = p.DecryptWithOptions(EncryptionOptions{}, corruptedCiphertext)
+		if err == nil {
+			t.Fatal("Expected error for corrupted ciphertext, but got none")
+		}
+	})
+
+	t.Run("TruncatedCiphertext", func(t *testing.T) {
+		p, _, err := lm.GetPolicy(ctx, PolicyRequest{
+			Upsert:       true,
+			Storage:      storage,
+			KeyType:      KeyType_KYBER,
+			Name:         "test-kyber-truncated",
+			ParameterSet: ParameterSet_KYBER_768,
+		}, rand.Reader)
+		if err != nil {
+			t.Fatalf("Failed to create policy: %v", err)
+		}
+		defer p.Unlock()
+
+		plaintext := []byte("Test message for truncation")
+		input := base64.StdEncoding.EncodeToString(plaintext)
+
+		validCiphertext, err := p.EncryptWithOptions(EncryptionOptions{}, input)
+		if err != nil {
+			t.Fatalf("Failed to encrypt: %v", err)
+		}
+
+		truncatedCiphertext := validCiphertext[:len(validCiphertext)/2]
+		_, err = p.DecryptWithOptions(EncryptionOptions{}, truncatedCiphertext)
+		if err == nil {
+			t.Fatal("Expected error for truncated ciphertext, but got none")
+		}
+	})
+
+	t.Run("WrongKeyForDecryption", func(t *testing.T) {
+		p1, _, err := lm.GetPolicy(ctx, PolicyRequest{
+			Upsert:       true,
+			Storage:      storage,
+			KeyType:      KeyType_KYBER,
+			Name:         "test-kyber-key1",
+			ParameterSet: ParameterSet_KYBER_512,
+		}, rand.Reader)
+		if err != nil {
+			t.Fatalf("Failed to create first policy: %v", err)
+		}
+		defer p1.Unlock()
+
+		p2, _, err := lm.GetPolicy(ctx, PolicyRequest{
+			Upsert:       true,
+			Storage:      storage,
+			KeyType:      KeyType_KYBER,
+			Name:         "test-kyber-key2",
+			ParameterSet: ParameterSet_KYBER_512,
+		}, rand.Reader)
+		if err != nil {
+			t.Fatalf("Failed to create second policy: %v", err)
+		}
+		defer p2.Unlock()
+
+		plaintext := []byte("Secret message")
+		input := base64.StdEncoding.EncodeToString(plaintext)
+		ciphertext, err := p1.EncryptWithOptions(EncryptionOptions{}, input)
+		if err != nil {
+			t.Fatalf("Failed to encrypt with first key: %v", err)
+		}
+
+		_, err = p2.DecryptWithOptions(EncryptionOptions{}, ciphertext)
+		if err == nil {
+			t.Fatal("Expected error when decrypting with wrong key, but got none")
+		}
+	})
+
+	t.Run("EmptyPlaintext", func(t *testing.T) {
+		p, _, err := lm.GetPolicy(ctx, PolicyRequest{
+			Upsert:       true,
+			Storage:      storage,
+			KeyType:      KeyType_KYBER,
+			Name:         "test-kyber-empty",
+			ParameterSet: ParameterSet_KYBER_1024,
+		}, rand.Reader)
+		if err != nil {
+			t.Fatalf("Failed to create policy: %v", err)
+		}
+		defer p.Unlock()
+
+		emptyPlaintext := []byte("")
+		input := base64.StdEncoding.EncodeToString(emptyPlaintext)
+
+		ciphertext, err := p.EncryptWithOptions(EncryptionOptions{}, input)
+		if err != nil {
+			t.Fatalf("Failed to encrypt empty plaintext: %v", err)
+		}
+
+		decrypted, err := p.DecryptWithOptions(EncryptionOptions{}, ciphertext)
+		if err != nil {
+			t.Fatalf("Failed to decrypt empty ciphertext: %v", err)
+		}
+
+		decryptedPlaintext, err := base64.StdEncoding.DecodeString(decrypted)
+		if err != nil {
+			t.Fatalf("Failed to decode empty decrypted data: %v", err)
+		}
+
+		if !bytes.Equal(emptyPlaintext, decryptedPlaintext) {
+			t.Fatalf("Empty plaintext test failed")
+		}
+	})
+
+	t.Run("LargePlaintext", func(t *testing.T) {
+		p, _, err := lm.GetPolicy(ctx, PolicyRequest{
+			Upsert:       true,
+			Storage:      storage,
+			KeyType:      KeyType_KYBER,
+			Name:         "test-kyber-large",
+			ParameterSet: ParameterSet_KYBER_512,
+		}, rand.Reader)
+		if err != nil {
+			t.Fatalf("Failed to create policy: %v", err)
+		}
+		defer p.Unlock()
+
+		largePlaintext := make([]byte, 1024*10)
+		for i := range largePlaintext {
+			largePlaintext[i] = byte(i % 256)
+		}
+		input := base64.StdEncoding.EncodeToString(largePlaintext)
+
+		ciphertext, err := p.EncryptWithOptions(EncryptionOptions{}, input)
+		if err != nil {
+			t.Fatalf("Failed to encrypt large plaintext: %v", err)
+		}
+
+		decrypted, err := p.DecryptWithOptions(EncryptionOptions{}, ciphertext)
+		if err != nil {
+			t.Fatalf("Failed to decrypt large ciphertext: %v", err)
+		}
+
+		decryptedPlaintext, err := base64.StdEncoding.DecodeString(decrypted)
+		if err != nil {
+			t.Fatalf("Failed to decode large decrypted data: %v", err)
+		}
+
+		if !bytes.Equal(largePlaintext, decryptedPlaintext) {
+			t.Fatalf("Large plaintext test failed")
+		}
+	})
+
+	t.Run("InvalidKeyVersion", func(t *testing.T) {
+		p, _, err := lm.GetPolicy(ctx, PolicyRequest{
+			Upsert:       true,
+			Storage:      storage,
+			KeyType:      KeyType_KYBER,
+			Name:         "test-kyber-version",
+			ParameterSet: ParameterSet_KYBER_768,
+		}, rand.Reader)
+		if err != nil {
+			t.Fatalf("Failed to create policy: %v", err)
+		}
+		defer p.Unlock()
+
+		plaintext := []byte("Test message")
+		input := base64.StdEncoding.EncodeToString(plaintext)
+
+		_, err = p.EncryptWithOptions(EncryptionOptions{KeyVersion: 999}, input)
+		if err == nil {
+			t.Fatal("Expected error for invalid key version, but got none")
+		}
+
+		_, err = p.EncryptWithOptions(EncryptionOptions{KeyVersion: -1}, input)
+		if err == nil {
+			t.Fatal("Expected error for negative key version, but got none")
+		}
+	})
+
+	t.Run("MismatchedParameterSets", func(t *testing.T) {
+		parameterSets := []string{
+			ParameterSet_KYBER_512,
+			ParameterSet_KYBER_768,
+			ParameterSet_KYBER_1024,
+		}
+
+		var policies []*Policy
+		var ciphertexts []string
+		plaintext := []byte("Cross-parameter test message")
+		input := base64.StdEncoding.EncodeToString(plaintext)
+
+		for i, paramSet := range parameterSets {
+			p, _, err := lm.GetPolicy(ctx, PolicyRequest{
+				Upsert:       true,
+				Storage:      storage,
+				KeyType:      KeyType_KYBER,
+				Name:         fmt.Sprintf("test-kyber-param-%d", i),
+				ParameterSet: paramSet,
+			}, rand.Reader)
+			if err != nil {
+				t.Fatalf("Failed to create policy for %s: %v", paramSet, err)
+			}
+			policies = append(policies, p)
+
+			ciphertext, err := p.EncryptWithOptions(EncryptionOptions{}, input)
+			if err != nil {
+				t.Fatalf("Failed to encrypt with %s: %v", paramSet, err)
+			}
+			ciphertexts = append(ciphertexts, ciphertext)
+		}
+
+		defer func() {
+			for _, p := range policies {
+				p.Unlock()
+			}
+		}()
+
+		for i, p1 := range policies {
+			for j, ct := range ciphertexts {
+				if i == j {
+					continue
+				}
+
+				_, err := p1.DecryptWithOptions(EncryptionOptions{}, ct)
+				if err == nil {
+					t.Fatalf("Expected error when decrypting %s data with %s key, but got none",
+						parameterSets[j], parameterSets[i])
+				}
+			}
+		}
+	})
+}
